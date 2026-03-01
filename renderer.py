@@ -10,7 +10,8 @@ from hand_tracker import (
     FINGERTIP_IDS,
 )
 from gesture import HandState, GrabState
-from objects import DraggableRect, DraggableCircle
+from objects import Wireframe3DObject
+from projection import Camera
 
 # Colors per finger group (BGR): Thumb, Index, Middle, Ring, Pinky
 FINGER_COLORS = [
@@ -21,44 +22,95 @@ FINGER_COLORS = [
     (100, 100, 255), # Pinky - pink
 ]
 
-OBJECT_ALPHA = 0.7
 GRAB_BORDER_COLOR = (0, 255, 0)     # Green
 HOVER_BORDER_COLOR = (255, 255, 0)  # Cyan
-BORDER_THICKNESS = 3
+BORDER_THICKNESS = 2
+
+# Depth shading range
+MIN_BRIGHTNESS = 0.4
+MAX_BRIGHTNESS = 1.0
 
 
 class Renderer:
+    def __init__(self, camera: Camera):
+        self.camera = camera
+
     def draw_objects(
         self,
         frame: np.ndarray,
-        objects: list[DraggableRect | DraggableCircle],
+        objects: list[Wireframe3DObject],
     ) -> np.ndarray:
-        overlay = frame.copy()
+        # Sort by z_depth descending (far objects first = Painter's Algorithm)
+        sorted_objs = sorted(objects, key=lambda o: o.z_depth, reverse=True)
 
-        for obj in objects:
-            if isinstance(obj, DraggableRect):
-                x1 = int(obj.x - obj.width / 2)
-                y1 = int(obj.y - obj.height / 2)
-                x2 = int(obj.x + obj.width / 2)
-                y2 = int(obj.y + obj.height / 2)
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), obj.color, -1)
+        for obj in sorted_objs:
+            screen_pts, depths = obj.get_world_vertices(self.camera)
+            self._draw_wireframe(frame, obj, screen_pts, depths)
 
-                if obj.grabbed:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), GRAB_BORDER_COLOR, BORDER_THICKNESS)
-                elif obj.hover:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), HOVER_BORDER_COLOR, BORDER_THICKNESS)
-
-            elif isinstance(obj, DraggableCircle):
-                center = (int(obj.x), int(obj.y))
-                cv2.circle(overlay, center, int(obj.radius), obj.color, -1)
-
-                if obj.grabbed:
-                    cv2.circle(frame, center, int(obj.radius), GRAB_BORDER_COLOR, BORDER_THICKNESS)
-                elif obj.hover:
-                    cv2.circle(frame, center, int(obj.radius), HOVER_BORDER_COLOR, BORDER_THICKNESS)
-
-        cv2.addWeighted(overlay, OBJECT_ALPHA, frame, 1 - OBJECT_ALPHA, 0, frame)
         return frame
+
+    def _draw_wireframe(
+        self,
+        frame: np.ndarray,
+        obj: Wireframe3DObject,
+        screen_pts: np.ndarray,
+        depths: np.ndarray,
+    ) -> None:
+        # Collect edges with their average depth for sorting
+        edge_list: list[tuple[float, int, int]] = []
+        for idx in range(len(obj.edges)):
+            i, j = obj.edges[idx]
+            avg_depth = (depths[i] + depths[j]) / 2.0
+            edge_list.append((avg_depth, i, j))
+
+        # Sort edges: far edges first (draw behind)
+        edge_list.sort(key=lambda e: e[0], reverse=True)
+
+        # Compute depth range for brightness mapping
+        all_depths = depths
+        d_min = float(all_depths.min())
+        d_max = float(all_depths.max())
+        d_range = d_max - d_min if d_max > d_min else 1.0
+
+        base_b, base_g, base_r = obj.color
+
+        for avg_depth, i, j in edge_list:
+            p1 = (int(screen_pts[i, 0]), int(screen_pts[i, 1]))
+            p2 = (int(screen_pts[j, 0]), int(screen_pts[j, 1]))
+
+            # Depth-based brightness: closer = brighter
+            t = 1.0 - (avg_depth - d_min) / d_range  # 0=far, 1=close
+            brightness = MIN_BRIGHTNESS + t * (MAX_BRIGHTNESS - MIN_BRIGHTNESS)
+
+            edge_color = (
+                int(base_b * brightness),
+                int(base_g * brightness),
+                int(base_r * brightness),
+            )
+
+            # Black outline + colored line
+            cv2.line(frame, p1, p2, (0, 0, 0), 3)
+            cv2.line(frame, p1, p2, edge_color, 1)
+
+        # Draw vertex dots for closer vertices
+        for idx in range(len(screen_pts)):
+            t = 1.0 - (depths[idx] - d_min) / d_range
+            brightness = MIN_BRIGHTNESS + t * (MAX_BRIGHTNESS - MIN_BRIGHTNESS)
+            dot_color = (
+                int(base_b * brightness),
+                int(base_g * brightness),
+                int(base_r * brightness),
+            )
+            pt = (int(screen_pts[idx, 0]), int(screen_pts[idx, 1]))
+            cv2.circle(frame, pt, 2, dot_color, -1)
+
+        # Grab / hover bounding circle
+        if obj.grabbed or obj.hover:
+            center = screen_pts.mean(axis=0).astype(int)
+            scale = self.camera.focal / max(obj.z_depth, 1.0)
+            proj_radius = int(obj.bounding_radius * scale)
+            color = GRAB_BORDER_COLOR if obj.grabbed else HOVER_BORDER_COLOR
+            cv2.circle(frame, tuple(center), proj_radius, color, BORDER_THICKNESS)
 
     def draw_hand(self, frame: np.ndarray, hand: HandData) -> np.ndarray:
         pts = hand.landmarks_px.astype(np.int32)
@@ -81,8 +133,7 @@ class Renderer:
             radius = 6 if idx in FINGERTIP_IDS else 3
             cv2.circle(frame, pos, radius + 2, (0, 0, 0), -1)
 
-            # Find which finger this landmark belongs to
-            color = (200, 200, 200)  # Default (wrist)
+            color = (200, 200, 200)
             for finger_idx, group_connections in enumerate(FINGER_CONNECTIONS):
                 group_ids = set()
                 for i, j in group_connections:
@@ -109,7 +160,6 @@ class Renderer:
             cv2.circle(frame, tuple(mid), 12, (0, 255, 0), 2)
             cv2.circle(frame, tuple(mid), 4, (0, 255, 0), -1)
         elif hand_state.pinch_distance < 80:
-            # Fading indicator as fingers approach
             alpha = max(0, 1.0 - hand_state.pinch_distance / 80)
             intensity = int(255 * alpha)
             color = (0, intensity, intensity)
@@ -133,7 +183,7 @@ class Renderer:
         lines = [
             "Pinch: Grab object",
             "Drag: Move object",
-            "Open: Release",
+            "Open: Release (with inertia)",
             "R: Reset  Q/ESC: Quit",
         ]
         h = frame.shape[0]

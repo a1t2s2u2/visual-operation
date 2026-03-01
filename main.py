@@ -7,6 +7,8 @@ from hand_tracker import HandTracker
 from gesture import GestureDetector
 from objects import create_default_objects
 from renderer import Renderer
+from projection import Camera
+from physics import PhysicsEngine
 
 
 class App:
@@ -16,8 +18,10 @@ class App:
 
     def __init__(self):
         self.tracker = HandTracker()
-        self.gesture = GestureDetector()
-        self.renderer = Renderer()
+        self.camera = Camera(self.CAMERA_WIDTH, self.CAMERA_HEIGHT, fov_deg=60.0)
+        self.gesture = GestureDetector(self.camera)
+        self.renderer = Renderer(self.camera)
+        self.physics = PhysicsEngine(self.CAMERA_WIDTH, self.CAMERA_HEIGHT)
         self.objects = create_default_objects()
         self.fps = 0.0
         self.fps_alpha = 0.3
@@ -39,16 +43,24 @@ class App:
                 if not ret:
                     break
 
+                # dt calculation
+                now = time.time()
+                dt = now - prev_time
+                prev_time = now
+
                 # Mirror display
                 frame = cv2.flip(frame, 1)
+
+                # Physics step
+                self.physics.step(self.objects, dt)
 
                 # Detect hands
                 hands = self.tracker.process(frame)
 
-                # Update gestures for all hands at once
-                hand_states = self.gesture.update_all(hands, self.objects)
+                # Update gestures for all hands
+                hand_states = self.gesture.update_all(hands, self.objects, now)
 
-                # Draw objects (semi-transparent)
+                # Draw wireframe objects
                 self.renderer.draw_objects(frame, self.objects)
 
                 # Draw hand skeletons and pinch indicators
@@ -57,9 +69,6 @@ class App:
                     self.renderer.draw_pinch_indicator(frame, hand, hs)
 
                 # FPS calculation (EMA smoothed)
-                now = time.time()
-                dt = now - prev_time
-                prev_time = now
                 if dt > 0:
                     instant_fps = 1.0 / dt
                     self.fps = self.fps_alpha * instant_fps + (1 - self.fps_alpha) * self.fps
