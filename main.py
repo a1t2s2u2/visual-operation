@@ -45,11 +45,8 @@ class App:
                 # Detect hands
                 hands = self.tracker.process(frame)
 
-                # Update gestures for each hand
-                hand_states = []
-                for hand in hands:
-                    hs = self.gesture.update(hand, self.objects)
-                    hand_states.append(hs)
+                # Update gestures for all hands at once
+                hand_states = self.gesture.update_all(hands, self.objects)
 
                 # Draw objects (semi-transparent)
                 self.renderer.draw_objects(frame, self.objects)
